@@ -361,6 +361,185 @@ def three_scenario_valuation(current_price, current_eps, shares_billion,
 
 
 # ---------------------------------------------------------------------------
+# 7. DCF Valuation (多阶段折现现金流估值)
+# ---------------------------------------------------------------------------
+
+def _dcf_core(fcf, growth_rates, r, g_term, shares, net_debt):
+    """Pure decimal DCF math, reused by main calc and the sensitivity grid."""
+    if r <= g_term:
+        return None
+
+    total_pv = Decimal("0")
+    prev_fcf = fcf
+    discount_factor = Decimal("1")
+    rows = []
+    for g in growth_rates:
+        year_fcf = _CTX.multiply(prev_fcf, _CTX.add(Decimal("1"), g))
+        discount_factor = _CTX.divide(discount_factor, _CTX.add(Decimal("1"), r))
+        pv = _CTX.multiply(year_fcf, discount_factor)
+        total_pv = _CTX.add(total_pv, pv)
+        rows.append((year_fcf, discount_factor, pv))
+        prev_fcf = year_fcf
+
+    terminal_fcf = _CTX.multiply(prev_fcf, _CTX.add(Decimal("1"), g_term))
+    terminal_value = _CTX.divide(terminal_fcf, _CTX.subtract(r, g_term))
+    pv_terminal = _CTX.multiply(terminal_value, discount_factor)
+
+    enterprise_value = _CTX.add(total_pv, pv_terminal)
+    equity_value = _CTX.subtract(enterprise_value, net_debt)
+    per_share = _CTX.divide(equity_value, shares) if shares != 0 else None
+
+    return {
+        "rows": rows,
+        "terminal_value": terminal_value,
+        "pv_terminal": pv_terminal,
+        "total_pv_explicit": total_pv,
+        "enterprise_value": enterprise_value,
+        "equity_value": equity_value,
+        "per_share": per_share,
+    }
+
+
+def dcf_valuation(base_fcf, growth_rates, discount_rate, terminal_growth, shares,
+                  net_debt=0.0, current_price=None, currency=""):
+    """Multi-stage DCF: explicit-period FCF + Gordon-growth terminal value."""
+    print("=" * 60)
+    print("多阶段DCF折现现金流估值 (Discounted Cash Flow)")
+    print("=" * 60)
+
+    fcf = exact(base_fcf)
+    r = exact(discount_rate)
+    g_term = exact(terminal_growth)
+    shares_d = exact(shares)
+    net_debt_d = exact(net_debt)
+    growth_d = [exact(g) for g in growth_rates]
+
+    print(f"  基期FCF:     {fmt_number(fcf)} {currency}")
+    print(f"  折现率(WACC): {float(r)*100:.2f}%")
+    print(f"  永续增长率:  {float(g_term)*100:.2f}%")
+    print(f"  显性预测期:  {len(growth_d)}年")
+    print(f"  净负债:      {fmt_number(net_debt_d)} {currency}  (现金净额记为负值)")
+    print()
+
+    core = _dcf_core(fcf, growth_d, r, g_term, shares_d, net_debt_d)
+    if core is None:
+        print(f"  ❌ 折现率({float(r)*100:.2f}%)必须大于永续增长率({float(g_term)*100:.2f}%)，无法计算终值")
+        return None
+
+    print(f"  {'年份':6} {'增速':>8} {'FCF':>14} {'折现因子':>10} {'现值PV':>14}")
+    print(f"  {'-'*6} {'-'*8} {'-'*14} {'-'*10} {'-'*14}")
+    for i, (year_fcf, disc, pv) in enumerate(core["rows"], start=1):
+        print(f"  第{i}年  {float(growth_d[i-1])*100:>6.1f}%  {float(year_fcf):>14.1f}  "
+              f"{float(disc):>10.4f}  {float(pv):>14.1f}")
+
+    print()
+    print(f"  终值(第{len(growth_d)}年末, 永续增长{float(g_term)*100:.1f}%): {fmt_number(core['terminal_value'])} {currency}")
+    print(f"  终值现值(PV of TV): {fmt_number(core['pv_terminal'])} {currency}")
+    print()
+    print(f"  显性期FCF现值合计: {fmt_number(core['total_pv_explicit'])} {currency}")
+    print(f"  企业价值(EV) = 显性期PV + 终值PV = {fmt_number(core['enterprise_value'])} {currency}")
+    print(f"  股权价值 = EV - 净负债 = {fmt_number(core['equity_value'])} {currency}")
+
+    per_share = core["per_share"]
+    if per_share is not None:
+        print(f"  每股内在价值 = 股权价值 / 总股本 = {fmt_number(per_share)} {currency}")
+
+    if current_price is not None and per_share is not None:
+        p = exact(current_price)
+        margin = _CTX.divide(_CTX.subtract(per_share, p), p) * 100
+        print()
+        print(f"  当前股价: {float(p):.2f} {currency}")
+        print(f"  安全边际: {float(margin):+.1f}%  ({'低估' if margin > 0 else '高估'})")
+
+    # Sensitivity grid: how much does per-share value swing with WACC / terminal growth?
+    print()
+    print("  敏感度分析（折现率 × 永续增长率 → 每股内在价值，其余假设不变）")
+    dr_range = [r - Decimal("0.01"), r, r + Decimal("0.01")]
+    tg_range = [g_term - Decimal("0.005"), g_term, g_term + Decimal("0.005")]
+    header = "  折现率\\永续增长 " + "".join(f"{float(tg)*100:>10.2f}%" for tg in tg_range)
+    print(header)
+    for dr in dr_range:
+        row = f"  {float(dr)*100:>10.2f}% "
+        for tg in tg_range:
+            cell = _dcf_core(fcf, growth_d, dr, tg, shares_d, net_debt_d)
+            if cell is None or cell["per_share"] is None:
+                row += f"{'N/A':>11}"
+            else:
+                row += f"{float(cell['per_share']):>10.2f} "
+        print(row)
+
+    print()
+    print("  ⚠️  DCF对假设（增速/折现率/永续增长率）极度敏感，是判断的量化，不是精确科学")
+    print("  ✅ 所有现值计算使用精确十进制, 结果可审计复现")
+
+    return {
+        "enterprise_value": float(core["enterprise_value"]),
+        "equity_value": float(core["equity_value"]),
+        "per_share": float(per_share) if per_share is not None else None,
+    }
+
+
+# ---------------------------------------------------------------------------
+# 8. Comparable Company (Comps) Implied Valuation (可比公司相对估值)
+# ---------------------------------------------------------------------------
+
+def comps_valuation(metric_name, target_value, peer_values: dict, basis="per-share",
+                    shares=None, net_debt=0.0, currency=""):
+    """Implied valuation from peer trading multiples (relative valuation)."""
+    print("=" * 60)
+    print(f"可比公司相对估值 (Comps): {metric_name}")
+    print("=" * 60)
+
+    values = {k: exact(v) for k, v in peer_values.items()}
+    nums = sorted(float(v) for v in values.values())
+    n = len(nums)
+    median = nums[n // 2] if n % 2 == 1 else (nums[n // 2 - 1] + nums[n // 2]) / 2
+    mean = sum(nums) / n
+    lo, hi = nums[0], nums[-1]
+
+    print(f"  同业样本数: {n}")
+    for peer, mult in values.items():
+        print(f"    {peer:20s}: {float(mult):>8.2f}x")
+    print()
+    print(f"  同业{metric_name}倍数 — 最低: {lo:.2f}x  中位数: {median:.2f}x  平均: {mean:.2f}x  最高: {hi:.2f}x")
+    print()
+
+    tv = exact(target_value)
+    basis_label = {"per-share": "每股指标", "enterprise": "企业层面指标(EV类)", "equity": "股权层面指标"}[basis]
+    print(f"  标的{metric_name}对应指标值({basis_label}): {fmt_number(tv)} {currency}")
+    if basis in ("enterprise", "equity") and shares:
+        print(f"  总股本: {fmt_number(exact(shares))}  净负债: {fmt_number(exact(net_debt))} {currency}")
+    print()
+
+    print(f"  {'口径':12} {'倍数':>8} {'隐含' + ('EV' if basis == 'enterprise' else '股权价值' if basis == 'equity' else '价值'):>14} {'每股价值':>12}")
+
+    results = {}
+    for label, mult in [("最低", lo), ("同业中位数", median), ("同业平均", mean), ("最高", hi)]:
+        mult_d = exact(mult)
+        implied = _CTX.multiply(tv, mult_d)
+        per_share = None
+        if basis == "per-share":
+            per_share = implied
+        elif shares:
+            shares_d = exact(shares)
+            if basis == "enterprise":
+                equity = _CTX.subtract(implied, exact(net_debt))
+            else:
+                equity = implied
+            per_share = _CTX.divide(equity, shares_d) if shares_d != 0 else None
+
+        ps_str = f"{float(per_share):.2f}" if per_share is not None else "N/A(需--shares)"
+        print(f"  {label:12} {float(mult_d):>7.2f}x  {float(implied):>14.1f}  {ps_str:>12}")
+        results[label] = float(per_share) if per_share is not None else None
+
+    print()
+    print("  💡 comps给出相对估值区间参考，需与DCF等绝对估值交叉验证")
+    print("  ⚠️  同业样本的业务模式/成长阶段/会计口径需真正可比，否则倍数没有意义")
+
+    return results
+
+
+# ---------------------------------------------------------------------------
 # CLI Entry Point
 # ---------------------------------------------------------------------------
 
@@ -422,6 +601,32 @@ Examples:
     ts.add_argument("--years", type=int, default=3)
     ts.add_argument("--currency", default="")
 
+    # dcf
+    dc = sub.add_parser("dcf", help="多阶段DCF折现现金流估值")
+    dc.add_argument("--fcf", type=float, required=True, help="基期自由现金流(总额,非每股)")
+    dc.add_argument("--growth", nargs="+", type=float, required=True,
+                    help="显性预测期各年增速,如 0.15 0.15 0.12 0.10 0.08")
+    dc.add_argument("--discount-rate", type=float, required=True, help="折现率(WACC),如 0.10")
+    dc.add_argument("--terminal-growth", type=float, required=True, help="永续增长率,如 0.025")
+    dc.add_argument("--shares", type=float, required=True, help="总股本(与FCF同计量单位)")
+    dc.add_argument("--net-debt", type=float, default=0.0, help="净负债(总额,净现金记为负值)")
+    dc.add_argument("--current-price", type=float, default=None, help="当前股价,用于计算安全边际")
+    dc.add_argument("--currency", default="")
+
+    # comps
+    cp = sub.add_parser("comps", help="可比公司(相对估值)隐含估值")
+    cp.add_argument("--metric-name", required=True, help="倍数类型,如 PE / EV-EBITDA / PS / PB")
+    cp.add_argument("--target-value", type=float, required=True,
+                    help="标的对应指标值,依--basis而定(每股指标或总额指标)")
+    cp.add_argument("--peer-values", required=True, help='JSON: {"同业A":18.2,"同业B":22.1}')
+    cp.add_argument("--basis", choices=["per-share", "enterprise", "equity"], default="per-share",
+                    help="per-share=每股指标(如EPS/BVPS)直接得每股价格；"
+                         "enterprise=企业层指标(如EBITDA)得EV再扣净负债除股数；"
+                         "equity=股权层总额指标(如净利润)得股权价值再除股数")
+    cp.add_argument("--shares", type=float, default=None, help="总股本(basis=enterprise/equity时必填)")
+    cp.add_argument("--net-debt", type=float, default=0.0, help="净负债(basis=enterprise时使用)")
+    cp.add_argument("--currency", default="")
+
     args = parser.parse_args()
 
     if args.command == "verify-market-cap":
@@ -443,6 +648,15 @@ Examples:
             args.growth[0], args.growth[1], args.growth[2],
             args.pe[0], args.pe[1], args.pe[2],
             args.years, args.currency)
+    elif args.command == "dcf":
+        dcf_valuation(
+            args.fcf, args.growth, args.discount_rate, args.terminal_growth,
+            args.shares, args.net_debt, args.current_price, args.currency)
+    elif args.command == "comps":
+        peer_values = json.loads(args.peer_values)
+        comps_valuation(
+            args.metric_name, args.target_value, peer_values, args.basis,
+            args.shares, args.net_debt, args.currency)
     else:
         parser.print_help()
 

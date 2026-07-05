@@ -52,6 +52,7 @@ reports/
 | /thesis-tracker | `{公司名}-thesis.md`（长期维护） | `reports/腾讯/腾讯-thesis.md` |
 | /portfolio-review | `portfolio-latest.md`（根目录，持续更新） | `reports/portfolio-latest.md` |
 | /management-deep-dive | `{公司名}-management-{YYYYMMDD}.md` | `reports/腾讯/腾讯-management-20260409.md` |
+| /dcf-comps | `{公司名}-valuation-{YYYYMMDD}.md` | `reports/腾讯/腾讯-valuation-20260409.md` |
 
 ## /investment-team 文件结构
 
